@@ -1,7 +1,8 @@
 """
 troy-maat-pdf-ingest
-Reads CBA bank statement PDFs from Supabase Storage 'statements' bucket,
+Reads CBA and Amex bank statement PDFs from Supabase Storage 'statements' bucket,
 extracts transactions, inserts into maat_transactions.
+Convention: amount is always POSITIVE = spend/debit. Payments stored positive, category=Transfer.
 
 Invoke payload:
 {
@@ -145,9 +146,8 @@ def parse_cba_pdf(pdf_bytes, account_label, account_number_last4):
         if not dt:
             continue
         amt = float(amt_str.replace(',', ''))
-        # Dr = debit = money out = negative
-        if dr_cr.upper() == 'DR':
-            amt = -amt
+        # MAAT convention: positive = spend/debit. Always use ABS.
+        amt = abs(amt)
         desc_clean = desc.strip()
         transactions.append({
             "posted_at": dt,
@@ -157,6 +157,102 @@ def parse_cba_pdf(pdf_bytes, account_label, account_number_last4):
             "category": categorise(desc_clean, amt),
             "source_type": "PDF_LAMBDA"
         })
+
+    return transactions
+
+
+
+def parse_amex_pdf(pdf_bytes, account_label, account_number_last4):
+    """
+    Parse Amex credit card PDF statements.
+    Amex PDFs list charges as positive amounts (debit = positive convention).
+    Returns list of dicts: {posted_at, description, amount, category}
+    MAAT convention: positive = spend. Payments/credits stored as positive too
+    but categorised as 'Transfer' so P&L excludes them correctly.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        raise RuntimeError("pdfplumber not available — add Lambda layer")
+
+    transactions = []
+    pdf_file = io.BytesIO(pdf_bytes)
+
+    month_map = {
+        'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+        'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12
+    }
+
+    # Amex statement line: "16 Mar 2026  REDLANDS.NSW.EDU.AU CREMORNE  1,882.68"
+    # Payment line:        "17 Mar 2026  BPAY PAYMENT-THANK YOU  2,000.00"
+    date_pat = re.compile(
+        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})',
+        re.IGNORECASE
+    )
+    amount_pat = re.compile(r'([\d,]+\.\d{2})')
+
+    def parse_date(s):
+        parts = s.strip().split()
+        if len(parts) == 3:
+            d, m, y = int(parts[0]), month_map[parts[1].lower()], int(parts[2])
+            return date(y, m, d).isoformat()
+        return None
+
+    def categorise_amex(desc):
+        desc_l = desc.lower()
+        if any(x in desc_l for x in ['bpay', 'payment thank', 'payment - thank']):
+            return 'Transfer'
+        if any(x in desc_l for x in ['interest charge', 'interest', 'annual fee']):
+            return 'Bank Fees'
+        if any(x in desc_l for x in ['aws', 'amazon web', 'google cloud', 'google*cloud']):
+            return 'Software & Subscriptions'
+        if any(x in desc_l for x in ['e-toll', 'etoll']):
+            return 'Motor Vehicle'
+        if any(x in desc_l for x in ['optus', 'telstra']):
+            return 'Telecommunications'
+        if any(x in desc_l for x in ['netflix', 'disney', 'spotify', 'prime video', 'apple.com']):
+            return 'Software & Subscriptions'
+        if any(x in desc_l for x in ['xai', 'anthropic', 'openai', 'eleven labs', 'heygen']):
+            return 'AI/LLM Services'
+        if any(x in desc_l for x in ['google*workspace', 'google workspace']):
+            return 'Software & Subscriptions'
+        if any(x in desc_l for x in ['linkedin']):
+            return 'Software & Subscriptions'
+        return 'Uncategorised'
+
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                date_match = date_pat.match(line)
+                if not date_match:
+                    continue
+                dt = parse_date(date_match.group(1))
+                if not dt:
+                    continue
+                # Amount is the last number on the line
+                amounts = amount_pat.findall(line)
+                if not amounts:
+                    continue
+                amt = abs(float(amounts[-1].replace(',', '')))
+                # Description is between date and amount
+                desc_start = date_match.end()
+                desc_end   = line.rfind(amounts[-1])
+                desc_clean = line[desc_start:desc_end].strip()
+                if not desc_clean or amt == 0:
+                    continue
+                transactions.append({
+                    "posted_at":       dt,
+                    "description":     f"{desc_clean} - Amex {account_label} {account_number_last4 or ''}'.strip(),
+                    "raw_description": desc_clean,
+                    "amount":          amt,   # always positive — MAAT convention
+                    "category":        categorise_amex(desc_clean),
+                    "source_type":     "PDF_LAMBDA"
+                })
 
     return transactions
 
@@ -202,7 +298,7 @@ def insert_transactions(txns, source, source_id, import_run_id):
         posted = t["posted_at"]
         desc = t["description"].replace("'", "''")
         raw  = t.get("raw_description", "").replace("'", "''")
-        amt  = t["amount"]
+        amt  = abs(t["amount"])  # MAAT convention: positive = spend
         cat  = t.get("category", "Uncategorised").replace("'", "''")
         sid  = source_id
         irid = import_run_id
@@ -258,12 +354,20 @@ def ingest_source_id(source_id, pdf_bytes=None):
             return {"error": f"No supabase_path for {filename} — upload PDF first"}
         pdf_bytes = storage_download(supa_path)
 
-    # Parse
-    txns = parse_cba_pdf(
-        pdf_bytes,
-        source["account_label"],
-        source["account_number_last4"]
-    )
+    # Parse — route by institution
+    bank = (source.get("bank") or "CBA").upper()
+    if "AMEX" in bank or "AMERICAN EXPRESS" in bank:
+        txns = parse_amex_pdf(
+            pdf_bytes,
+            source["account_label"],
+            source["account_number_last4"]
+        )
+    else:
+        txns = parse_cba_pdf(
+            pdf_bytes,
+            source["account_label"],
+            source["account_number_last4"]
+        )
 
     if not txns:
         return {"error": f"No transactions extracted from {filename}", "source_id": source_id}
@@ -421,3 +525,4 @@ def lambda_handler(event, context):
     except Exception as e:
         import traceback
         return {"success": False, "error": str(e), "trace": traceback.format_exc()}
+
