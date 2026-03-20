@@ -247,7 +247,7 @@ def parse_amex_pdf(pdf_bytes, account_label, account_number_last4):
                     continue
                 transactions.append({
                     "posted_at":       dt,
-                    "description":     f"{desc_clean} - Amex {account_label} {account_number_last4 or ''}'.strip(),
+                    "description":     f"{desc_clean} - Amex {account_label} {account_number_last4 or ''}".strip(),
                     "raw_description": desc_clean,
                     "amount":          amt,   # always positive — MAAT convention
                     "category":        categorise_amex(desc_clean),
